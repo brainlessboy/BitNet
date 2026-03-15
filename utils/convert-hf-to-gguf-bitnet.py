@@ -342,6 +342,9 @@ class Model(ABC):
             res = "command-r"
         if chkhsh == "9d032fcbd5501f4a38150912590928bfb36091efb5df11b8e2124b0390e3fb1e":
             res = "falcon3"
+        if chkhsh == "e636dc30a262dcc0d8c323492e32ae2b70728f4df7dfe9737d9f920a282b8aea":
+            # ref: https://huggingface.co/Qwen/Qwen2.5-0.5B
+            res = "qwen2"
 
         if res is None:
             logger.warning("\n")
@@ -957,7 +960,12 @@ class BitnetModel(Model):
     model_arch = gguf.MODEL_ARCH.BITNET
 
     def set_vocab(self):
-        self._set_vocab_sentencepiece()
+        # Use SentencePiece if tokenizer.model exists, otherwise fall back to GPT2/BPE
+        tokenizer_path = self.dir_model / "tokenizer.model"
+        if tokenizer_path.is_file():
+            self._set_vocab_sentencepiece()
+        else:
+            self._set_vocab_gpt2()
         
     def set_gguf_parameters(self):
         super().set_gguf_parameters()

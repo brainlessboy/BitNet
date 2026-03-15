@@ -36,6 +36,10 @@ nppBackup
 models/*
 gpu/checkpoints/*
 
+# Distillation checkpoints
+distill/checkpoints/
+*.pt
+
 # Python
 
 /.venv
