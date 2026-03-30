@@ -957,7 +957,7 @@ class LlamaModel(Model):
 
 @Model.register("BitnetForCausalLM")
 class BitnetModel(Model):
-    model_arch = gguf.MODEL_ARCH.BITNET
+    model_arch = gguf.MODEL_ARCH.BITNET_B158
 
     def set_vocab(self):
         # Use SentencePiece if tokenizer.model exists, otherwise fall back to GPT2/BPE

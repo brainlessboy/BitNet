@@ -64,8 +64,9 @@ def flatten_state_dict(state_dict: dict) -> dict:
         elif ".mlp.down_proj.linear." in key:
             new_key = key.replace(".mlp.down_proj.linear.", ".mlp.down_proj.")
 
-        # Skip lm_head when using tied embeddings (shared with embed_tokens)
+        # For tied embeddings, copy embed_tokens as lm_head (GGUF needs it explicitly)
         if new_key == "lm_head.weight":
+            new_sd["lm_head.weight"] = state_dict["model.embed_tokens.weight"].clone()
             continue
 
         # Skip bias tensors — BitNet architecture doesn't use them
@@ -85,7 +86,7 @@ QUANTIZE_SUFFIXES = (
 
 def export(args):
     print(f"Loading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     state_dict = ckpt["model_state_dict"]
     config = ckpt["config"]
 
@@ -93,14 +94,8 @@ def export(args):
     print("Flattening state dict...")
     state_dict = flatten_state_dict(state_dict)
 
-    # Hard-quantize projection weights to ternary
-    print("Quantizing weights to ternary...")
-    n_quantized = 0
-    for key in list(state_dict.keys()):
-        if key.endswith(QUANTIZE_SUFFIXES):
-            state_dict[key] = weight_quant(state_dict[key])
-            n_quantized += 1
-    print(f"  Quantized {n_quantized} tensors")
+    # Note: skip quantization here — the GGUF converter applies ternary quantization
+    print("Skipping weight quantization (handled by GGUF converter)")
 
     # Convert all to float16 for storage
     for key in state_dict:
@@ -127,7 +122,7 @@ def export(args):
         "vocab_size": config.vocab_size,
         "rms_norm_eps": config.rms_norm_eps,
         "max_position_embeddings": config.max_position_embeddings,
-        "rope_theta": config.rope_theta,
+        "rope_theta": getattr(config, "rope_theta", None) or config.rope_parameters.get("rope_theta", 10000.0),
         "tie_word_embeddings": getattr(config, "tie_word_embeddings", True),
         "hidden_act": getattr(config, "hidden_act", "silu"),
         "torch_dtype": "float16",
@@ -139,7 +134,7 @@ def export(args):
 
     # Copy tokenizer from Qwen2.5-0.5B
     print("Copying tokenizer files...")
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_model)
     tokenizer.save_pretrained(args.output)
 
     # Print summary
@@ -168,6 +163,7 @@ def main():
     parser = argparse.ArgumentParser(description="Export BitDistill checkpoint to HuggingFace format")
     parser.add_argument("--checkpoint", required=True, help="Path to .pt checkpoint")
     parser.add_argument("--output", required=True, help="Output directory for HF-format model")
+    parser.add_argument("--tokenizer_model", default="Qwen/Qwen2.5-0.5B", help="HuggingFace model for tokenizer")
     args = parser.parse_args()
     export(args)
 
