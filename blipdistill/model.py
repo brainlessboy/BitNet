@@ -1,9 +1,8 @@
 """
 BitNet student model construction.
 
-Replicates the BitLinear + SubLN surgery from distill/distill.py
-but as a standalone module. Supports wider student architectures
-for faithful ternary replication.
+Supports same-size and wider student architectures.
+Wider students have more ternary capacity for faithful replication.
 """
 
 import torch
@@ -53,7 +52,11 @@ class NormedLinear(nn.Module):
         return self.linear(self.norm(x))
 
 
-def build_student(model_name: str, device: torch.device = torch.device("cpu")) -> PreTrainedModel:
+def build_student(
+    model_name: str,
+    device: torch.device = torch.device("cpu"),
+    use_gradient_checkpointing: bool = True,
+) -> PreTrainedModel:
     """
     Build a BitNet student from a pretrained model.
 
@@ -71,7 +74,6 @@ def build_student(model_name: str, device: torch.device = torch.device("cpu")) -
         attn = layer.self_attn
         mlp = layer.mlp
 
-        # Replace projections with BitLinear
         for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
             old = getattr(attn, name)
             new = BitLinear(old.in_features, old.out_features, bias=old.bias is not None)
@@ -88,21 +90,19 @@ def build_student(model_name: str, device: torch.device = torch.device("cpu")) -
                 new.bias = old.bias
             setattr(mlp, name, new)
 
-        # Insert SubLN before o_proj
         inner_attn_ln = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         attn.o_proj = NormedLinear(inner_attn_ln, attn.o_proj)
 
-        # Insert SubLN before down_proj
         ffn_ln = RMSNorm(config.intermediate_size, eps=config.rms_norm_eps)
         mlp.down_proj = NormedLinear(ffn_ln, mlp.down_proj)
 
-    # Freeze embeddings
     model.model.embed_tokens.weight.requires_grad = False
     if hasattr(model, "lm_head") and not model.config.tie_word_embeddings:
         model.lm_head.weight.requires_grad = False
 
     model.to(device)
     model.train()
-    model.gradient_checkpointing_enable()
+    if use_gradient_checkpointing:
+        model.gradient_checkpointing_enable()
 
     return model

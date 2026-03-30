@@ -1,3 +1,5 @@
-# BLIPDistill: Dataset-free BitNet distillation
-# Teacher as oracle — random probing + adversarial focus
-# No external dataset, knowledge comes directly from the teacher
+# BLIPDistill v2: Teacher-corpus BitNet distillation
+#
+# The teacher generates its own training corpus (structured text),
+# then the student learns from it with full-KL distillation.
+# No external dataset. Teacher's knowledge IS the training data.

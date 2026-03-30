@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-BLIPDistill: Dataset-free BitNet distillation.
+Phase 2: Full-KL distillation on teacher-generated corpus.
 
-The teacher IS the training data. No external dataset needed.
-Training signal comes from:
-  1. Random token probes → teacher responses (broad exploration)
-  2. Adversarial probes → find and fix max disagreement (focused refinement)
-  3. Teacher-continued probes → semi-structured inputs (in-distribution)
+Both teacher and student are in memory. The teacher's OWN text corpus
+(from generate_corpus.py) provides structured, knowledge-rich inputs.
+Full-vocab KL divergence ensures accurate gradient signal.
+
+This is the approach proven to work (Alpaca distillation produced coherent
+text), but with teacher-generated data instead of external datasets.
 
 Usage:
-    # Quick local test (0.5B, CPU/MPS)
-    python blipdistill/train.py --teacher Qwen/Qwen2.5-0.5B --device mps --max_steps 500
-
-    # Full run (3B, GPU)
-    python blipdistill/train.py --teacher Qwen/Qwen2.5-3B --device cuda --max_steps 5000
-
-    # Wider student for higher fidelity
-    python blipdistill/train.py --teacher Qwen/Qwen2.5-0.5B --device cuda --max_steps 5000 --seq_len 256
+    python blipdistill/train.py --teacher Qwen/Qwen2.5-0.5B --corpus blipdistill/corpus --device cuda
+    python blipdistill/train.py --teacher Qwen/Qwen2.5-3B --corpus blipdistill/corpus_3b --device cuda --max_steps 10000
 """
 
 import argparse
@@ -33,79 +28,6 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from blipdistill.model import build_student
-from blipdistill.probing import random_probe, adversarial_probe, ProbeScheduler, EmbeddingSpaceProbe
-from blipdistill.losses import combined_loss, QKCapture
-
-
-class ProbeDataset:
-    """Loads pre-extracted probe data from disk (from extract.py)."""
-
-    def __init__(self, probe_dir: str, device: torch.device):
-        self.device = device
-        metadata = torch.load(os.path.join(probe_dir, "metadata.pt"), weights_only=False)
-        self.vocab_size = metadata["vocab_size"]
-        self.top_k = metadata["top_k"]
-        self.seq_len = metadata["seq_len"]
-        self.n_examples = metadata["n_examples"]
-
-        # Load all chunks
-        self.chunks = []
-        chunk_files = sorted(f for f in os.listdir(probe_dir) if f.startswith("chunk_"))
-        for cf in chunk_files:
-            self.chunks.append(torch.load(os.path.join(probe_dir, cf), weights_only=False))
-
-        # Build flat index: (chunk_idx, position_in_chunk)
-        self.index = []
-        for ci, chunk in enumerate(self.chunks):
-            n = len(chunk["probe_types"])
-            for i in range(n):
-                self.index.append((ci, i))
-
-        print(f"  Loaded {len(self.index):,} probe examples from {len(self.chunks)} chunks")
-
-    def get_batch(self, batch_size: int) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
-        """
-        Get a random batch of (inputs_embeds_or_None, input_ids_or_None, teacher_logits).
-
-        Teacher logits are reconstructed from top-K sparse format to full vocab size.
-        """
-        indices = torch.randint(0, len(self.index), (batch_size,))
-
-        all_ids = []
-        all_logits = []
-
-        for idx in indices:
-            ci, pos = self.index[idx.item()]
-            chunk = self.chunks[ci]
-
-            # Get input_ids (works for both vocab_seed and rand probes)
-            if "input_ids" in chunk:
-                all_ids.append(chunk["input_ids"][pos])
-
-            # Reconstruct teacher soft targets from top-K
-            # These are already probabilities (after softmax with tau during extraction)
-            # Store as probabilities directly — the loss function will use them as targets
-            top_k_idx = chunk["top_k_indices"][pos]    # (seq_len, top_k) int32
-            top_k_probs = chunk["top_k_probs"][pos]    # (seq_len, top_k) float16
-
-            # Create sparse probability tensor (zeros for non-top-K tokens)
-            probs_float = top_k_probs.float()
-            # Replace NaN with uniform
-            nan_mask = probs_float.isnan()
-            if nan_mask.any():
-                probs_float[nan_mask] = 1.0 / self.top_k
-            full_probs = torch.zeros(self.seq_len, self.vocab_size)
-            for s in range(self.seq_len):
-                full_probs[s, top_k_idx[s].long()] = probs_float[s]
-            all_logits.append(full_probs)
-
-        teacher_logits = torch.stack(all_logits).to(self.device)
-
-        input_ids = None
-        if all_ids:
-            input_ids = torch.stack(all_ids).to(self.device)
-
-        return None, input_ids, teacher_logits
 
 
 # Pretty output
@@ -138,74 +60,105 @@ def empty_cache(device_str):
         torch.mps.empty_cache()
 
 
+class CorpusDataset:
+    """Loads teacher-generated text corpus from disk."""
+
+    def __init__(self, corpus_dir: str, device: torch.device):
+        self.device = device
+        metadata = torch.load(os.path.join(corpus_dir, "metadata.pt"), weights_only=False)
+        self.seq_len = metadata["seq_len"]
+        self.n_sequences = metadata["n_sequences"]
+
+        # Load all chunks into one big tensor
+        chunk_files = sorted(f for f in os.listdir(corpus_dir) if f.startswith("chunk_"))
+        all_seqs = []
+        for cf in chunk_files:
+            chunk = torch.load(os.path.join(corpus_dir, cf), weights_only=False)
+            all_seqs.append(chunk["sequences"])
+
+        self.sequences = torch.cat(all_seqs, dim=0)  # (n_sequences, seq_len)
+        print(f"  Loaded {self.sequences.shape[0]:,} sequences ({self.seq_len} tokens each)")
+
+    def get_batch(self, batch_size: int) -> torch.Tensor:
+        """Get a random batch of token sequences."""
+        indices = torch.randint(0, self.sequences.shape[0], (batch_size,))
+        return self.sequences[indices].to(self.device)
+
+
+def distillation_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    tau: float = 2.0,
+) -> tuple[torch.Tensor, float]:
+    """
+    Full-vocab KL divergence loss.
+
+    This is the PROVEN loss function — same as distill/distill.py.
+    No sparse approximation, no shortcuts.
+    """
+    student_logits = student_logits.float().clamp(-100, 100)
+    teacher_logits = teacher_logits.float().clamp(-100, 100)
+
+    student_soft = F.log_softmax(student_logits / tau, dim=-1)
+    teacher_soft = F.softmax(teacher_logits / tau, dim=-1)
+
+    loss = F.kl_div(student_soft, teacher_soft, reduction="batchmean") * (tau ** 2)
+
+    if torch.isnan(loss) or torch.isinf(loss):
+        return torch.tensor(0.0, device=loss.device, requires_grad=True), 0.0
+
+    return loss, loss.item()
+
+
 def train(args):
     device = torch.device(args.device)
     t_start = time.time()
 
     teacher_name = args.teacher.split("/")[-1]
-    offline_mode = args.probe_data is not None
+    banner(f"BLIPDistill: {teacher_name} → 1.58-bit BitNet")
 
-    if offline_mode:
-        banner(f"BLIPDistill: {teacher_name} → 1.58-bit BitNet (offline probes)")
-    else:
-        banner(f"BLIPDistill: {teacher_name} → 1.58-bit BitNet (dataset-free)")
-
-    # --- Load teacher (only if online mode) ---
-    teacher = None
-    if offline_mode:
-        section("Loading pre-extracted probe data")
-        probe_dataset = ProbeDataset(args.probe_data, device)
-        vocab_size = probe_dataset.vocab_size
-        info("Probe examples", f"{probe_dataset.n_examples:,}")
-        info("Top-K", probe_dataset.top_k)
-    else:
-        section("Loading teacher")
-        t0 = time.time()
-        teacher = AutoModelForCausalLM.from_pretrained(
-            args.teacher, torch_dtype=torch.float16, attn_implementation="eager"
-        )
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad = False
-        teacher.to(device)
-        vocab_size = teacher.config.vocab_size
-
-        info("Parameters", f"{sum(p.numel() for p in teacher.parameters()):,}")
-        info("Loaded in", f"{time.time() - t0:.1f}s")
+    # --- Load teacher ---
+    section("Loading teacher")
+    print(f"  {DIM}Downloading/loading model weights...{RESET}")
+    teacher = AutoModelForCausalLM.from_pretrained(
+        args.teacher, torch_dtype=torch.float16, attn_implementation="eager"
+    )
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+    teacher.to(device)
+    print(f"  {DIM}Teacher on {args.device}{RESET}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.teacher)
-    info("Model", args.teacher)
-    info("Vocab size", f"{vocab_size:,}")
-    info("Mode", "offline (probes from disk)" if offline_mode else "online (teacher live)")
+    config = teacher.config
 
-    # Enable TF32 on CUDA
+    info("Model", args.teacher)
+    info("Parameters", f"{sum(p.numel() for p in teacher.parameters()):,}")
+    info("Vocab size", f"{config.vocab_size:,}")
+
     if args.device == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         info("TF32", "enabled")
 
+    # --- Load corpus ---
+    section("Loading teacher-generated corpus")
+    corpus = CorpusDataset(args.corpus, device)
+
     # --- Build student ---
-    section("Building student (BitLinear + SubLN surgery)")
-    t0 = time.time()
-    student = build_student(args.teacher, device=device)
+    section("Building student (BitLinear + SubLN)")
+    print(f"  {DIM}Loading and modifying model...{RESET}")
+    student = build_student(
+        args.teacher, device=device,
+        use_gradient_checkpointing=(args.device != "cuda"),
+    )
 
     total_params = sum(p.numel() for p in student.parameters())
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
     info("Total parameters", f"{total_params:,}")
     info("Trainable", f"{trainable_params:,} ({trainable_params / total_params * 100:.1f}%)")
-    info("Built in", f"{time.time() - t0:.1f}s")
 
-    # --- Register QKV hooks for attention distillation (online mode only) ---
-    n_layers = student.config.num_hidden_layers
-    student_cap = None
-    teacher_cap = None
-    if not offline_mode:
-        student_cap = QKCapture()
-        teacher_cap = QKCapture()
-        student_cap.register(student.model.layers[n_layers - 1].self_attn)
-        teacher_cap.register(teacher.model.layers[n_layers - 1].self_attn)
-
-    # --- Optimizer and scheduler ---
+    # --- Optimizer ---
     optimizer = torch.optim.AdamW(
         [p for p in student.parameters() if p.requires_grad],
         lr=args.lr, weight_decay=0.01,
@@ -222,121 +175,72 @@ def train(args):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    probe_scheduler = ProbeScheduler(total_steps, adversarial_warmup=args.adversarial_warmup)
-
-    # Initialize embedding space probe (online mode only)
-    embed_probe = None
-    if not offline_mode:
-        section("Analyzing teacher embedding space")
-        embed_probe = EmbeddingSpaceProbe(teacher)
-        info("Embedding dim", embed_probe.embed_dim)
-        info("Principal components", embed_probe.components.shape[0])
-
-    # --- Training log ---
+    # --- Output setup ---
     output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
     ckpt_dir = os.path.join(output_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
+
     log_path = os.path.join(output_dir, "training_log.jsonl")
     with open(log_path, "w") as f:
-        f.write(json.dumps({"type": "header", "total_steps": total_steps, "mode": "dataset-free"}) + "\n")
+        f.write(json.dumps({
+            "type": "header",
+            "total_steps": total_steps,
+            "mode": "teacher_corpus",
+            "teacher": args.teacher,
+        }) + "\n")
 
-    # --- Training loop ---
-    section(f"Training ({total_steps} steps, dataset-free)")
+    # --- Training ---
+    section(f"Training ({total_steps} steps)")
+    effective_batch = args.batch_size * args.accumulation_steps
     info("Batch size", args.batch_size)
-    info("Sequence length", args.seq_len)
     info("Accumulation", args.accumulation_steps)
+    info("Effective batch", effective_batch)
+    info("Sequence length", corpus.seq_len)
     info("Temperature", args.tau)
-    info("Adversarial warmup", f"{args.adversarial_warmup} steps")
-    info("Probe modes", "random + teacher-continued + adversarial")
+    info("Learning rate", f"{args.lr} (cosine decay)")
+    info("Warmup", f"{warmup_steps} steps")
+    info("Data source", "teacher-generated corpus (full-KL)")
     print()
 
     best_loss = float("inf")
     accum_loss = 0.0
-    accum_ld = 0.0
-    accum_ad = 0.0
     global_step = 0
     optimizer.zero_grad()
 
     for step_idx in range(total_steps * args.accumulation_steps):
         accum_pos = (step_idx % args.accumulation_steps) + 1
 
-        # --- Generate probe input + get teacher response ---
-        if offline_mode:
-            # Load from pre-extracted probes
-            inputs_embeds, input_ids, teacher_logits = probe_dataset.get_batch(args.batch_size)
-            use_embeds = inputs_embeds is not None
-            probe_type = "DISK"
-        else:
-            # Online: generate probes and run teacher live
-            adv_ratio = probe_scheduler.get_adversarial_ratio(global_step)
+        # Get batch from corpus
+        input_ids = corpus.get_batch(args.batch_size)
 
-            if adv_ratio > 0 and torch.rand(1).item() < adv_ratio:
-                input_ids = adversarial_probe(
-                    teacher, student, vocab_size,
-                    args.batch_size, args.seq_len, device,
-                    n_steps=args.adversarial_steps,
-                )
-                probe_type = "ADV"
-                use_embeds = False
-            elif embed_probe is not None and torch.rand(1).item() < 0.5:
-                inputs_embeds = embed_probe.sample(args.batch_size, args.seq_len, device)
-                probe_type = "EMBED"
-                use_embeds = True
-            else:
-                input_ids = random_probe(vocab_size, args.batch_size, args.seq_len, device)
-                probe_type = "RAND"
-                use_embeds = False
+        # Teacher forward
+        with torch.no_grad():
+            teacher_out = teacher(input_ids)
+            teacher_logits = teacher_out.logits.float().detach()
+            del teacher_out
+        empty_cache(args.device)
 
-            with torch.no_grad():
-                if use_embeds:
-                    teacher_out = teacher(inputs_embeds=inputs_embeds.to(
-                        next(teacher.parameters()).dtype))
-                else:
-                    teacher_out = teacher(input_ids)
-                teacher_logits = teacher_out.logits.float().detach()
-                del teacher_out
-            empty_cache(args.device)
+        # Student forward
+        student_out = student(input_ids=input_ids)
 
-        # --- Student forward ---
-        if use_embeds and inputs_embeds is not None:
-            student_out = student(inputs_embeds=inputs_embeds)
-        elif input_ids is not None:
-            student_out = student(input_ids=input_ids)
-        else:
-            # Fallback: random tokens
-            input_ids = random_probe(vocab_size, args.batch_size, args.seq_len, device)
-            student_out = student(input_ids=input_ids)
-            probe_type = "RAND"
-
-        # --- Loss ---
-        loss, ld, ad = combined_loss(
-            student_out.logits, teacher_logits,
-            student_cap, teacher_cap,
-            tau=args.tau, lambda_ld=1.0, gamma_ad=args.gamma_ad,
-            teacher_is_probs=offline_mode,
-        )
+        # Full-vocab KL loss
+        loss, ld = distillation_loss(student_out.logits, teacher_logits, tau=args.tau)
         loss = loss / args.accumulation_steps
 
-        # Skip NaN batches (can happen with extreme random inputs)
+        # NaN guard
         if torch.isnan(loss) or torch.isinf(loss):
             optimizer.zero_grad()
             accum_loss = 0.0
-            accum_ld = 0.0
-            accum_ad = 0.0
             del student_out, teacher_logits
             empty_cache(args.device)
             continue
 
         loss.backward()
-
         accum_loss += loss.item()
-        accum_ld += ld
-        accum_ad += ad
 
         del student_out, teacher_logits
 
-        # --- Progress ---
+        # Optimizer step
         if accum_pos == args.accumulation_steps:
             torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
             optimizer.step()
@@ -345,9 +249,6 @@ def train(args):
             global_step += 1
 
             avg_loss = accum_loss
-            avg_ld = accum_ld / args.accumulation_steps
-            avg_ad = accum_ad / args.accumulation_steps
-
             if avg_loss < best_loss:
                 best_loss = avg_loss
 
@@ -356,35 +257,29 @@ def train(args):
             eta = (total_steps - global_step) / sps if sps > 0 else 0
             lr_now = scheduler.get_last_lr()[0]
 
-            # Print progress
             eta_m, eta_s = divmod(int(eta), 60)
             eta_h, eta_m = divmod(eta_m, 60)
             eta_str = f"{eta_h}h{eta_m:02d}m" if eta_h else f"{eta_m}m{eta_s:02d}s"
 
             print(f"  {GREEN}{BOLD}Step {global_step}/{total_steps}{RESET}"
                   f"  {DIM}|{RESET} loss {YELLOW}{avg_loss:.2f}{RESET}"
-                  f"  {DIM}|{RESET} LD {avg_ld:.1f}  AD {avg_ad:.1f}"
                   f"  {DIM}|{RESET} lr {lr_now:.1e}"
-                  f"  {DIM}|{RESET} {probe_type}"
                   f"  {DIM}ETA {eta_str}{RESET}")
 
             # Log
             with open(log_path, "a") as f:
                 f.write(json.dumps({
                     "type": "step", "step": global_step,
-                    "loss": avg_loss, "ce": 0.0, "ld": avg_ld, "ad": avg_ad,
+                    "loss": avg_loss, "ce": 0.0, "ld": avg_loss, "ad": 0.0,
                     "lr": lr_now, "elapsed": elapsed, "eta": eta,
-                    "probe": probe_type,
                 }) + "\n")
 
             accum_loss = 0.0
-            accum_ld = 0.0
-            accum_ad = 0.0
 
             # Save checkpoint
             if global_step % args.save_every == 0:
                 save_path = os.path.join(ckpt_dir, f"step_{global_step}.pt")
-                print(f"    {DIM}Saving checkpoint...{RESET}", end="", flush=True)
+                print(f"    {DIM}Saving...{RESET}", end="", flush=True)
                 torch.save({
                     "step": global_step,
                     "model_state_dict": student.state_dict(),
@@ -405,7 +300,7 @@ def train(args):
         if step_idx % 50 == 0:
             empty_cache(args.device)
 
-    # --- Save final ---
+    # Save final
     final_path = os.path.join(ckpt_dir, "final.pt")
     torch.save({
         "step": global_step,
@@ -413,12 +308,7 @@ def train(args):
         "config": student.config,
     }, final_path)
 
-    if student_cap:
-        student_cap.remove()
-    if teacher_cap:
-        teacher_cap.remove()
-
-    # --- Summary ---
+    # Summary
     total_time = time.time() - t_start
     t_h, rem = divmod(int(total_time), 3600)
     t_m, t_s = divmod(rem, 60)
@@ -430,33 +320,27 @@ def train(args):
     info("Best loss", f"{best_loss:.4f}")
     info("Final checkpoint", final_path)
     print()
-    section("Next step")
-    print(f"\n    python distill/deploy.py {final_path}")
+    section("Next steps")
+    print(f"\n  {DIM}# Test quality{RESET}")
+    print(f"  python distill/test_checkpoint.py {final_path} -n 50 -t 0.7 -r 1.3")
+    print()
+    print(f"  {DIM}# Deploy{RESET}")
+    print(f"  python distill/deploy.py {final_path}")
     print()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="BLIPDistill: Dataset-free BitNet distillation",
-    )
+    parser = argparse.ArgumentParser(description="BLIPDistill: Full-KL distillation on teacher corpus")
     parser.add_argument("--teacher", required=True, help="HuggingFace teacher model")
+    parser.add_argument("--corpus", required=True, help="Path to teacher-generated corpus")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accumulation_steps", type=int, default=4)
-    parser.add_argument("--seq_len", type=int, default=256)
-    parser.add_argument("--max_steps", type=int, default=2000)
+    parser.add_argument("--max_steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--tau", type=float, default=2.0, help="Distillation temperature")
-    parser.add_argument("--gamma_ad", type=float, default=0.01, help="Attention distillation weight")
-    parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--tau", type=float, default=2.0)
+    parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--output_dir", default="blipdistill")
-    parser.add_argument("--adversarial_warmup", type=int, default=200,
-                        help="Steps before adversarial probing starts")
-    parser.add_argument("--adversarial_steps", type=int, default=5,
-                        help="Gradient steps per adversarial probe")
-    parser.add_argument("--probe_data", default=None,
-                        help="Path to pre-extracted probe data (from extract.py). "
-                             "If provided, teacher is not loaded — trains from disk only.")
     args = parser.parse_args()
     train(args)
 
